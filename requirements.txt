@@ -1,0 +1,14 @@
+numpy>=1.15.4
+pandas>=1.2.0
+scipy
+beautifulsoup4
+deep_translator
+hn
+langdetect
+Markdown
+networkx
+PyGithub
+python_hn
+requests
+setuptools
+tqdm
