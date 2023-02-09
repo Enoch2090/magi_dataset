@@ -58,3 +58,10 @@ And you can access the corpus by accessing the `readme` and `hn_comments` attrib
 >>> github_dataset[5].readme[0:100]
 '[![Build Status](https://github.com/ytdl-org/youtube-dl/workflows/CI/badge.svg)](https'
 ```
+
+## Future Works
+
+- The current idle handler design is primordial, will switch to async pipelines to relieve CPU sleep time.
+- Elasticsearch database builder
+- Pinecone database builder (wrapper only)
+- Hash verification of persistence files

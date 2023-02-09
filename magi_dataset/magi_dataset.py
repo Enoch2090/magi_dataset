@@ -154,10 +154,10 @@ class GitHubDataset(object):
         self.lang_stats = defaultdict(int)
         self.reverse_map = {}
         self.G = None        
+        self._init_artifacts()
         if empty:
             return
-
-        self._init_artifacts()
+        
         if file_path is None:
             # fallback to check online versions of data
             with tempfile.TemporaryDirectory() as tmpdirname:
@@ -328,7 +328,7 @@ class GitHubDataset(object):
             result = self._translator_artifact.translate(x) 
         except DTRequestError as e:
             if self._translate_err_counter <= self.TRANSLATE_MAX_RETRY:
-                self._idle_handler.translate_rate_exceed_idle()
+                self._idle_handler_artifact.translate_rate_exceed_idle()
                 self._translate_err_counter += 1
                 result = self._translate_wrapper(x)
             else:
@@ -418,7 +418,7 @@ class GitHubDataset(object):
             repositories = self._github_artifact.search_repositories(query=f'stars:>{self.MIN_STAR_PER_REPO} language:{lang}')
             success = 0
             do_break = False
-            for index, repo in tqdm(enumerate(repositories), total=self.MAX_REPO_PER_LANG):
+            for index, repo in enumerate(repositories):
                 if do_break:
                     break
                 while True:
