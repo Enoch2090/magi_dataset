@@ -12,8 +12,19 @@ export GH_TOKEN="Your token"
 
 Read [Creating a personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) for more information on creating GitHub personal access token. If using the default data without crawling new data, you may safely ignore this token.
 
-
 ## Usage
+
+The recommended way to use magi_dataset is to run the collection process in chunked mode. First create an empty dataset and initiate index from GitHub:
+
+```python
+```
+
+
+
+
+
+
+
 Initialize an empty instance and collect data:
 
 ```python

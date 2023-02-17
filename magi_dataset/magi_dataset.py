@@ -1,4 +1,4 @@
-from threading import local
+import argparse
 import requests
 import time
 import json
@@ -6,12 +6,14 @@ import re
 import os
 import sys
 import logging
+import hashlib
 import pickle
 import pandas as pd
 import tempfile
 
+
 from bs4 import BeautifulSoup
-from typing import List, Tuple, Union, Dict, Callable
+from typing import List, Tuple, Union, Dict, Callable, final
 from tqdm import tqdm, trange
 from datetime import datetime
 from pathlib import Path
@@ -23,10 +25,11 @@ from langdetect import detect
 from langdetect.detector import LangDetectException
 from deep_translator import GoogleTranslator
 from deep_translator.exceptions import RequestError as DTRequestError
-from dataclasses import dataclass, field, asdict
-from collections import defaultdict
+from dataclasses import dataclass, field, fields, asdict
+from collections import defaultdict, deque
 
-logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s', level=logging.INFO, filename='./magi_dataset.log')
 magi_dataclasses_logger = logging.getLogger(__name__)
 
 SOURCE_LIST_LINK = 'https://huggingface.co/datasets/Enoch2090/github_semantic_search/resolve/main/list.json'
@@ -96,6 +99,7 @@ class GitHubRepo:
     lang: str = field(default = '', repr = False)
     repo_lang: str = field(default = '', repr = False)
     readme: str = field(default = '', repr = False)
+    readme_type: str = field(default = '', repr = False)
     hn_comments: str = field(default = '', repr = False)
     gh_updated_time: str = field(default = '', repr = False)
     gh_accessed_time: str = field(default = '', repr = False)
@@ -124,27 +128,44 @@ class GitHubRepo:
         pattern = re.compile(r'(https?://)?github.com/(?!{})([^/^\(^\)^\s^<^>^#^\[^\]]*/[^/^\(^\)^\s^<^>^#^\[^\]]*)'.format(self.name))
         return list(set([x[-1] for x in pattern.findall(self.readme)] + [x[-1] for x in pattern.findall(self.hn_comments)]))
     
+    @staticmethod
+    def _fields(self, preserved = False) -> set:
+        if preserved:
+            return set(
+                [x.name for x in fields(GitHubRepo)]
+            )
+        return set(
+            [x.name for x in fields(GitHubRepo) if x.name[0] != '_']
+        )
+    
     def __hash__(self) -> int:
         return (self.name + self.gh_updated_time).__hash__()
     
 class GitHubDataset(object):
-    MAX_REPO_PER_LANG = 1000
-    MIN_STAR_PER_REPO = 50
-    TRANSLATE_MAX_RETRY = 3
-    CHECKPOINT_PERIOD = 200
+    MAX_REPO_PER_LANG = 100_000
+    MIN_STAR_PER_REPO = 100
+    TRANSLATE_MAX_RETRY = 1
+    CHECKPOINT_PERIOD = 1000
     LANG_LIST = ['Python', 'C++', 'JavaScript', 'Rust', 'Go']
+    ITER_CHUNK_SIZE = 4000
     
     def __init__(
         self, 
         empty: bool = True, 
         lang_list: List[str] = None, 
         file_path: Union[str, os.PathLike, Path] = None, 
+        patterns: Union[str, os.PathLike, Path] = None, 
+        gh_token: str = None
     ):
         '''
         Arguments:
             - empty (bool): Whether to init the data. If true, the returned GitHubDataset object will be empty. GitHubDataset.init_repos() or GitHubDataset.load() can be called later to initialize the data.
             - lang_list (List[str]): Coding languages included in this GitHubDataset object. Default to ['Python', 'C++', 'JavaScript', 'Rust', 'Go'].
             - file_path (str): If provided and empty=False, will try to load the file at given location. Can be one of str to online source, str to local file, or PathLike objects.
+            - patterns (Union[List[Union[str, re.Pattern]], str]): Either a str to a file containing regex patterns, or a list of patterns. If str, it must be a text file, with each line a new regex pattern. 
+                Example line: ^[\S]*[Mm]achine[-_]*[Ll]earning[\S]*$
+            If list, must be either a list of str patterns, or a list of compiled regex object generated with re.compile().
+            If left blank, the default list will be used.
         '''
         self.data = []
         self._translate_err_counter = 0
@@ -153,8 +174,15 @@ class GitHubDataset(object):
             self.LANG_LIST = lang_list
         self.lang_stats = defaultdict(int)
         self.reverse_map = {}
-        self.G = None        
+        self._init_map = defaultdict(bool) # bool() = False
+        self._chunk_map = [[]]
+        self._chunk_lang_map = [[]]
+        self._chunk_sizes = [0]
+        self._init_fingerprint = None
+        self._curr_chunk_id = 0
+        self.GH_TOKEN = gh_token
         self._init_artifacts()
+        self._load_patterns(patterns)
         if empty:
             return
         
@@ -203,10 +231,13 @@ class GitHubDataset(object):
         if type(idx) is int:
             return self.data[idx]
         return self.data[self.reverse_map[idx]]
-    
+
     def __setitem__(self, idx, val):
         assert type(val) is GitHubRepo, 'Item must be of GitHubRepo type'
-        self.data[idx] = val
+        if type(idx) is int:
+            self.data[idx] = val
+        else:
+            self.data[self.reverse_map[idx]] = val              
     
     def __iter__(self):
         self._it_idx = 0
@@ -240,6 +271,10 @@ class GitHubDataset(object):
         langs = ', '.join([f'{lang}: List_{self.lang_stats[lang]}' for lang in self.LANG_LIST])
         return f'GitHubDataset({langs})'
     
+    @property
+    def _chunk_num(self):
+        return len(self._chunk_sizes)
+    
     def _remove_code_chunk(self):
         pattern = re.compile('```[\s\S]+```')
         for idx in range(self.__len__()):
@@ -258,7 +293,8 @@ class GitHubDataset(object):
             - See https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token
             - If this token is not set, then the rate limit is extremely low, which will be totally unusable 
         '''
-        self.GH_TOKEN = os.getenv('GH_TOKEN') 
+        if self.GH_TOKEN is None: 
+            self.GH_TOKEN = os.getenv('GH_TOKEN') 
         self._github_artifact = Github(self.GH_TOKEN)
         self._translator_artifact = GoogleTranslator(source='auto', target='en')
         self._idle_handler_artifact = IdleHandler()
@@ -268,17 +304,24 @@ class GitHubDataset(object):
         repo_object: GitHubRepo, 
         repo: Repository.Repository = None
     ):
+        if repo is None:
+            repo = self._github_artifact.get_repo(repo_object.name)
         repo_object.stars = repo.stargazers_count
         if (not repo_object._fully_initialized) or (repo.updated_at > repo_object.gh_updated_parsed_time):
             root_file_list = repo.get_contents('')
             readme_filename = None
             readme_content = ''
             readme_lang = 'en'
+            readme_type = 'text'
             for c in root_file_list:
                 if not ('README' in c.name or 'readme' in c.name):
                     continue
                 readme_filename = c.name
             if readme_filename is not None:
+                if '.md' in readme_filename or '.markdown' in readme_filename:
+                    readme_type = 'markdown'
+                if '.rst' in readme_filename:
+                    readme_type = 'rst'
                 repo_readme = repo.get_contents(readme_filename)
                 if type(repo_readme) is list:
                     dl_url = repo_readme[0].download_url
@@ -291,7 +334,10 @@ class GitHubDataset(object):
                     except LangDetectException:
                         readme_lang = 'en'
                 if not readme_lang == 'en':
-                    readme_content = self._chunk_translate_en(readme_content)
+                    readme_content = self._chunk_translate_en(readme_content) 
+                if readme_content is None:
+                    readme_content = ''
+                    magi_dataclasses_logger.error(f'Repo {repo_object.name} translation error') 
             hn_comments = ''
             while True:
                 try:
@@ -305,9 +351,11 @@ class GitHubDataset(object):
             repo_object.description = repo.description
             repo_object.orig_lang = readme_lang
             repo_object.readme = readme_content
+            repo_object.readme_type = readme_type
             repo_object.hn_comments = hn_comments
             repo_object.updated = repo.updated_at.strftime('%Y/%m/%d, %H:%M:%S')
             repo_object.retrieved = datetime.now().strftime('%Y/%m/%d, %H:%M:%S')
+        return repo_object
     
     def _rebuild_rmap(self):
         for index, repo in enumerate(self.data):
@@ -321,28 +369,29 @@ class GitHubDataset(object):
     
     def _translate_wrapper(
         self, 
-        x: str
-    ):
+        x: Union[str, list]
+    ) -> Union[str, list, None]:
         result = ''
+        self._translate_err_counter = 0
         try:
-            result = self._translator_artifact.translate(x) 
+            if type(x) is str:
+                result = self._translator_artifact.translate(x)
+            elif type(x) is list:
+                x = [_x for _x in x if _x != '']
+                result = self._translator_artifact.translate_batch(x)
         except DTRequestError as e:
-            if self._translate_err_counter <= self.TRANSLATE_MAX_RETRY:
-                self._idle_handler_artifact.translate_rate_exceed_idle()
+            self._idle_handler_artifact.translate_rate_exceed_idle()
+            if self._translate_err_counter < self.TRANSLATE_MAX_RETRY:
                 self._translate_err_counter += 1
                 result = self._translate_wrapper(x)
             else:
-                x_list = x.split(' ')
-                x_len = len(x_list) // 2
-                magi_dataclasses_logger.warning(f'{e}, split into {x_len} and {len(x_list) - x_len}')
-                result = self._translate_wrapper(' '.join(x_list[0:x_len])) + ' ' + self._translate_wrapper(' '.join(x_list[x_len::]))
+                return None
         except ConnectionError as e:
-            if self._translate_err_counter <= self.TRANSLATE_MAX_RETRY:
+            if self._translate_err_counter < self.TRANSLATE_MAX_RETRY:
                 self._translate_err_counter += 1
                 result = self._translate_wrapper(x)
             else:
                 result = ''
-        self._translate_err_counter = 0
         return result
     
     def _divide(
@@ -350,7 +399,7 @@ class GitHubDataset(object):
         text: str, 
         chunk_len: int = 2048
     ) -> List[str]:
-        n_chunks = len(text) // chunk_len
+        n_chunks = len(text) // chunk_len + 1
         return [
             text[i*chunk_len: i*chunk_len+chunk_len] if i != n_chunks - 1 else text[i*chunk_len::] for i in range(n_chunks)
         ]
@@ -364,13 +413,7 @@ class GitHubDataset(object):
         if len(text) == 0:
             return ''
         try:
-            return ''.join(
-                list(
-                    map(
-                        self._translate_wrapper, self._divide(text)
-                    )
-                )
-            )
+            return ''.join(self._translate_wrapper(self._divide(text)))
         except TypeError:
             return ''
         
@@ -397,171 +440,9 @@ class GitHubDataset(object):
             text += f"{hn_comments_text}<HN_SEP>"
         return text
     
-    def init_repos(
-        self, 
-        fully_initialize: bool = False, 
-        checkpoint_path: str = None
-    ) -> None:
+    def _load_patterns(self, patterns: Union[List[Union[str, re.Pattern]], str] = None):
         '''
-        Initialize self.data and update them according to the fully_initialize parameter.
-        Arguments:
-            - fully_initialize (bool): Whether to fully initialize contents in each GitHubRepo, or only initialize names. If fully_initialize=True, will initiailize all contents, this will be time-consuming. If fully_initialize=False, only names are initialized, but the generated GitHubRepo will have attributes fully_initialize=False, and the usage will be very restricted. If call with fully_initialize=False, GitHubDataset.update_repos() must be called before using this dataset.
-            - checkpoint_path (str): str to local checkpoint files. If provided, will periodically dump to the given location.
-        Comments:
-            - TODO: Add load from checkpoint feature.
-        '''
-        control_idle = 0.1 if fully_initialize else 0.05
-        self.data = []
-        lang_report = defaultdict(int)
-        for lang in self.LANG_LIST:
-            magi_dataclasses_logger.info(f'Initializing language {lang}')
-            repositories = self._github_artifact.search_repositories(query=f'stars:>{self.MIN_STAR_PER_REPO} language:{lang}')
-            success = 0
-            do_break = False
-            for index, repo in enumerate(repositories):
-                if do_break:
-                    break
-                while True:
-                    self._idle_handler_artifact.github_rate_limit_control_idle(control_idle)
-                    try:
-                        if success >= self.MAX_REPO_PER_LANG:
-                            do_break = True
-                            break
-                        repo_object = GitHubRepo(
-                            name = repo.full_name,
-                            lang = lang
-                        )
-                        if fully_initialize:
-                            self._update_repo(repo_object, repo)
-                        self.data.append(repo_object)
-                        self.lang_stats[lang] += 1
-                        success += 1
-                        if success % self.CHECKPOINT_PERIOD == 0:
-                            magi_dataclasses_logger.info(f'Coding language {lang}, initialization {success:5d} / {self.MAX_REPO_PER_LANG}')
-                            if checkpoint_path:
-                                self.dump(checkpoint_path)
-                        break
-                    except RateLimitExceededException as e:
-                        self._idle_handler_artifact.github_rate_limit_exceed_idle()
-            lang_report[lang] = index
-        self._rebuild_rmap()
-        if checkpoint_path:
-            self.dump(checkpoint_path)
-        for lang in self.LANG_LIST:
-            magi_dataclasses_logger.info(f'Coding language {lang} retrieved with {index} repositories')
-
-    def update_repos(self, checkpoint_path: str = None):
-        '''
-        Update all repos in self.data.
-        Arguments:
-            - checkpoint_path (str): str to local checkpoint files. If provided, will periodically dump to the given location.
-        Comments:
-            - TODO: Add load from checkpoint feature.
-        '''
-        for index in trange(len(self.data)):
-            while True:
-                self._idle_handler_artifact.github_rate_limit_control_idle(0.1)
-                try:
-                    self._update_repo(repo_object = self.data[index])
-                    success += 1
-                    if success % self.CHECKPOINT_PERIOD == 0:
-                        magi_dataclasses_logger.info(f'Updated {success:5d} / {self.MAX_REPO_PER_LANG}')
-                        if checkpoint_path:
-                            self.dump(checkpoint_path)
-                    break
-                except RateLimitExceededException as e:
-                    self._idle_handler_artifact.github_rate_limit_exceed_idle()
-        if checkpoint_path:
-            self.dump(checkpoint_path)
-        magi_dataclasses_logger.info(f'Update complete, {success} repos updated.')       
-        
-    def load(self, file: Union[str, Path]) -> None:
-        '''
-        Load from either a .pkl or a .json file dump.
-        Arguments:
-            - file (Union[str, Path]), either a str or PathLike object. Must be a .pkl or .json file.
-        Comments:
-            - TODO: Add file version check.
-        '''
-        if type(file) is str:
-            file = Path(file)
-        file = file.resolve()
-        assert file.exists(), f'{file} does not exist'
-        assert file.suffix in ['.pkl', '.json'], f'Unsupported load type {file.suffix}'
-        if file.suffix == '.pkl':
-            magi_dataclasses_logger.warning(f'Loading from a .pkl file from unknown source can be dangerous. See https://www.smartfile.com/blog/python-pickle-security-problems-and-solutions for an example of pickle attack. Therefore, you should consider using .json files for persistence and exchange.')
-            with open(file, 'rb') as f:
-                pickle_data_object = pickle.load(f)
-            for d in pickle_data_object:
-                assert type(d) is GitHubRepo, 'Pickled data must be of List[GitHubRepo] type'
-            self.data = pickle_data_object
-        elif file.suffix == '.json':
-            with open(file ,'r') as f:
-                json_data_object = json.load(f)
-            assert type(json_data_object) is list, 'JSON data must be of List[dict] type'
-            for index, d in enumerate(json_data_object):
-                assert type(d) is dict, 'JSON data must be of List[dict] type'
-                for k in GitHubRepo.__annotations__.keys():
-                    if k[0] == '_': # reserved properties
-                        continue
-                    assert k in d.keys(), f'JSON data of index {index} missing key {k}'
-            self.data = []
-            for d in json_data_object:
-                repo_object = GitHubRepo(
-                    **{
-                        k: d[k] for k in GitHubRepo.__annotations__.keys() if k[0] != '_'
-                    },
-                    _fully_initialized = True
-                )
-                self.data.append(repo_object)
-        self.lang_stats = defaultdict(int)
-        for d in self.data:
-            self.lang_stats[d.lang] += 1
-        self._rebuild_rmap()
-        magi_dataclasses_logger.info(f'Loaded {len(self.data)} repos from {file}')
-        
-    def dump(self, file: Union[str, Path]) -> None:
-        '''
-        Dump to either a .pkl or a .json file dump.
-        Arguments:
-            - file (Union[str, Path]), either a str or PathLike object. Must be a .pkl or .json file.
-        Comments:
-            - TODO: Add file version check.
-        '''
-        if type(file) is str:
-            file = Path(file)
-        file = file.resolve()
-        assert file.suffix in ['.pkl', '.json'], f'Unsupported dump type {file.suffix}'
-        if file.suffix == '.pkl':
-            magi_dataclasses_logger.warning(f'Loading from a .pkl file from unknown source can be dangerous. See https://www.smartfile.com/blog/python-pickle-security-problems-and-solutions for an example of pickle attack. Therefore, you should consider using .json files for persistence and exchange.')
-            with open(file, 'wb') as f:
-                pickle.dump(self.data, f)
-        elif file.suffix == '.json':
-             with open(file ,'w') as f:
-                json_data_object = [
-                    {
-                        k: v for k, v in asdict(d).items() if k[0] != '_'
-                    } for d in self.data
-                ]
-                json.dump(json_data_object, f)
-        magi_dataclasses_logger.info(f'Dumped to {file}')
-     
-    def append(self, data: GitHubRepo) -> None:
-        '''
-        Append a new GitHubRepo object to self.data.
-        Arguments:
-            - data (GitHubRepo): GitHubRepo object to append.
-        Comments:
-            - Note that this method does not check for duplicates. Therefore, user should be aware of appending duplicates to self.data.
-        '''
-        assert type(data) is GitHubRepo
-        self.data.append(data)
-        self.lang_stats[data.lang] += 1
-        self._append_rmap(data)
-        
-    def filter_repos(self, patterns: Union[List[Union[str, re.Pattern]], str] = None):
-        '''
-        Remove GitHubRepo from self.data if its name match any of the pattern provided in patterns argument. By default this method removes the so-called "indexing repos" which are useless to MAGI's usecase.
+        Load the given filter patterns.
         Argument: 
             - patterns (Union[List[Union[str, re.Pattern]], str]): Either a str to a file containing regex patterns, or a list of patterns. If str, it must be a text file, with each line a new regex pattern. 
                 Example line: ^[\S]*[Mm]achine[-_]*[Ll]earning[\S]*$
@@ -572,35 +453,260 @@ class GitHubDataset(object):
             patterns = DEFAULT_FILES['patterns']
         if type(patterns) is str:
             with open(patterns, 'r') as f:
-                patterns = [x.replace('\n', '') for x in f.readlines()]
+                self.patterns = [x.replace('\n', '') for x in f.readlines()]
         # patterns: List[Union[str, re.Pattern]]
         if type(patterns[0]) is str:
-            patterns = [re.compile(r'{}'.format(p)) for p in patterns]
-        new_data = []
-        new_stats = defaultdict(int)
-        filtered_stats = defaultdict(int)
-        old_len = len(self.data)
-        remove_list = []
-        for repo in self.data:
-            found = False
-            for pattern in patterns:
-                if len(pattern.findall(repo.name.split('/')[-1])) != 0:
-                    found = True
-                    filtered_stats[repo.lang] += 1
-                    break
-            if not found:
-                new_data.append(repo)
-                new_stats[repo.lang] += 1
-            else:
-                remove_list.append(repo.name)
-        self.data = new_data
-        self.lang_stats = new_stats
-        
-        magi_dataclasses_logger.info(f'{old_len - len(self.data)} repos filtered out using {len(patterns)} patterns.')
-        magi_dataclasses_logger.info(f'filter_repos removal stats: {dict(filtered_stats)}')
+            self.patterns = [re.compile(r'{}'.format(p)) for p in self.patterns]
+
+    def _matches_pattern(self, name:str):
+        '''
+        Check whether the given name matches any of the pattern loaded by GitHubDataset._load_patterns()
+        '''
+        for pattern in self.patterns:
+            if len(pattern.findall(name.split('/')[-1])) != 0:
+                return True
+        return False
+
+    def init_repos(
+        self, 
+        fully_initialize: bool = False, 
+    ) -> None:
+        '''
+        Initialize self.data and update them according to the fully_initialize parameter.
+        The recommended way to rebuild the dataset is to run GitHubDataset.init_repos() with fully_initialize = False, and then use GitHubDataset.update_all_repos() to pull the information chunk by chunk, to ensure stability.
+        Arguments:
+            - fully_initialize (bool): Whether to fully initialize contents in each GitHubRepo, or only initialize names. If fully_initialize=True, will initiailize all contents, this will be time-consuming. If fully_initialize=False, only names are initialized, but the generated GitHubRepo will have attributes fully_initialize=False, and the usage will be very restricted. If call with fully_initialize=False, GitHubDataset.update_repos() must be called before using this dataset.
+        Comments:
+            - TODO: Add load from checkpoint feature.
+        '''
+        control_idle = 0.1 if fully_initialize else 0.05
+        self.data = []
+        for lang in self.LANG_LIST:
+            magi_dataclasses_logger.info(f'Initializing language {lang}')
+            curr_star_lowerbound = self.MIN_STAR_PER_REPO
+            curr_star_upperbound = 1_000_000
+            success = 0
+            end_curr_lang_search = False
+            recent_cache = deque(maxlen=100)
+            while not end_curr_lang_search:
+                repositories = self._github_artifact.search_repositories(query=f'stars:{curr_star_lowerbound}..{curr_star_upperbound} language:{lang}')
+                magi_dataclasses_logger.info(f'Searching scope "stars:{curr_star_lowerbound}..{curr_star_upperbound} language:{lang}"')
+                for repo in repositories:
+                    if end_curr_lang_search:
+                        magi_dataclasses_logger.info(f'Ending search for {lang}')
+                        break
+                    while True:
+                        self._idle_handler_artifact.github_rate_limit_control_idle(control_idle)
+                        try:
+                            if success >= self.MAX_REPO_PER_LANG:
+                                end_curr_lang_search = True
+                                break
+                            repo_name = repo.full_name
+                            star_num = repo.stargazers_count
+                            # if repo_name in recent_cache:
+                            #     end_curr_lang_search = True
+                            #     magi_dataclasses_logger.info(f'Search for {lang} ended, collection number={success} which reached the MAX_REPO_PER_LANG parameter.')
+                            #     break
+                            if self._matches_pattern(repo_name):
+                                magi_dataclasses_logger.info(f'Repo {repo_name} ignored')
+                                break
+                            repo_object = GitHubRepo(
+                                name = repo_name,
+                                lang = lang
+                            )
+                            if fully_initialize:
+                                self._update_repo(repo_object, repo)
+                                self._init_map[repo_name] = True
+                            else:
+                                self._init_map[repo_name] = False
+                            self.append(repo_object)
+                            magi_dataclasses_logger.info(f'Repo {repo_name} added (stars={star_num}), index={success}')
+                            success += 1
+                            recent_cache.append(repo_name)
+                            if self._chunk_sizes[-1] >= self.ITER_CHUNK_SIZE:
+                                # create a new virtual chunk
+                                self._chunk_sizes.append(0)
+                                self._chunk_map.append([])
+                                self._chunk_lang_map.append([])
+                            self._chunk_sizes[-1] += 1
+                            self._chunk_map[-1].append(repo_name)
+                            self._chunk_lang_map[-1].append(lang)
+                            curr_star_upperbound = star_num - 1
+                            
+                            if curr_star_upperbound <= self.MIN_STAR_PER_REPO:
+                                end_curr_lang_search = True
+                                magi_dataclasses_logger.info(f'Search for {lang} ended, curr_star_upperbound={curr_star_upperbound} <= MIN_STAR_PER_REPO={self.MIN_STAR_PER_REPO}')
+                            break
+                        except RateLimitExceededException as e:
+                            self._idle_handler_artifact.github_rate_limit_exceed_idle()
         self._rebuild_rmap()
-        return remove_list
+        for lang in self.LANG_LIST:
+            magi_dataclasses_logger.info(f'Coding language {lang} {"retrieved" if fully_initialize else "index built"} with {self.lang_stats[lang]} repositories')
+        hashlib.sha1().update(str(time.time()).encode("utf-8"))
+        self._init_fingerprint = hashlib.sha1().hexdigest()
+
+    def _update_chunk_repos(self, chunk_id):
+        for repo_name in self._chunk_map[chunk_id]:
+            while True:
+                try:
+                    self[repo_name] = self._update_repo(self[repo_name])
+                    magi_dataclasses_logger.info(f'Repo {repo_name} info updated')
+                    self._idle_handler_artifact.github_rate_limit_control_idle(0.05)
+                except RateLimitExceededException as e:
+                    self._idle_handler_artifact.github_rate_limit_exceed_idle()
+                finally:
+                    break
+            
+    def update_repos(self, chunks: Union[List[int], range, int] = -1):
+        assert type(chunks) in [list, range, int], 'Argument chunks must be one of list, range or int type.'
+        if chunks == -1:
+            chunks = list(range(self._chunk_num))
+        if type(chunks) is int:
+            chunks = [chunks]
+        for chunk_id in chunks:
+            self._update_chunk_repos(chunk_id)
+        magi_dataclasses_logger.info(f'Successfully updated chunk {chunks}, {len(chunks)}/{self._chunk_num} chunks changed.')
+    
+    def load_fingerprint(
+        self, 
+        file: Union[str, Path]
+    ) -> None:
+        '''
+        Load fingerprints and chunk indexes from a fingerprint metadata file.
+        Arguments:
+            - file(Union[str, Path]): .json file containing the fingerprint.
+        '''
+        with open(file, 'r') as f:
+                metadata = json.load(f)
+        self._init_fingerprint = metadata['_init_fingerprint']
+        self._chunk_map = metadata['_chunk_map']
+        self._chunk_lang_map = metadata['_chunk_lang_map']
+        self._chunk_sizes = metadata['_chunk_sizes']
+        self.data = []
+        # Rebuild all repos with name only.
+        # No matter how much chunks are loaded, all repos will be rebuilt.
+        for chunk_id in range(len(self._chunk_sizes)):
+            for repo_id in range(self._chunk_sizes[chunk_id]):
+                self.append(
+                    GitHubRepo(
+                        name = self._chunk_map[chunk_id][repo_id],
+                        lang = self._chunk_lang_map[chunk_id][repo_id]
+                    )
+                )
+        self._rebuild_rmap()
+
+    def dump_fingerprint(
+        self,
+        file: Union[str, Path]
+    ) -> None:
+        '''
+        Dump fingerprints and chunk indexes to a fingerprint metadata file.
+        Arguments:
+            - file(Union[str, Path]): .json file to dump the fingerprint.
+        '''
+        with open(file, 'w') as f:
+            json.dump(
+                {
+                    '_chunk_map': self._chunk_map,
+                    '_chunk_lang_map': self._chunk_lang_map,
+                    '_chunk_sizes': self._chunk_sizes,
+                    '_init_fingerprint': self._init_fingerprint
+                },
+                f
+            )
+    
+    def load(
+        self, 
+        file: Union[str, Path],
+        chunks: Union[List[int], range, int] = -1
+    ) -> None:
+        '''
+        Load from either a .pkl or a .json file dump.
+        Arguments:
+            - file (Union[str, Path]): either a str or PathLike object. Must be a .json file.
+            - chunks: One of list, range or int type to specify chunks to dump. If left empty, defaults to all chunks.
+        '''
+        if type(file) is str:
+            file = Path(file)
+        file = file.resolve()
+        assert file.exists(), f'{file} does not exist'
+        assert file.suffix in ['.json'], f'Unsupported load type {file.suffix}'
+        if chunks == -1:
+            chunks = list(range(len(self._chunk_map)))
+        if type(chunks) is int:
+            chunks = [chunks]
+        if file.suffix == '.json':
+            self.load_fingerprint(file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}')))
+            for chunk in chunks:
+                chunk_file = file.with_name(file.name.replace(file.suffix, f'-{chunk}{file.suffix}'))
+                with open(chunk_file ,'w') as f:
+                    json_data_object = json.load(f)
+                assert json_data_object['_init_fingerprint'] == self._init_fingerprint, f'File {chunk_file} has mismatched fingerprint with metadata.'
+                for d in json_data_object['data']:
+                    self[d['name']] = GitHubRepo(
+                        **{
+                            k: d[k] for k in GitHubRepo.__annotations__.keys() if k[0] != '_'
+                        },
+                        _fully_initialized = True if set(GitHubRepo.__annotations__.keys()) == GitHubRepo._fields(preserved=True) else False
+                    )
+                
+        self.lang_stats = defaultdict(int)
+        for d in self.data:
+            self.lang_stats[d.lang] += 1
+        magi_dataclasses_logger.info(f'Loaded {len(self.data)} repos from {file}')
         
+    def dump(
+            self, 
+            file: Union[str, Path],
+            chunks: Union[List[int], range, int] = -1
+        ) -> None:
+        '''
+        Dump to either a .pkl or a .json file dump.
+        Arguments:
+            - file (Union[str, Path]): Either a str or PathLike object. Must be a .json file.
+            - chunks: One of list, range or int type to specify chunks to dump. If left empty, defaults to all chunks.
+        '''
+        if type(file) is str:
+            file = Path(file)
+        file = file.resolve()
+        assert file.suffix in ['.json'], f'Unsupported dump type {file.suffix}'
+        assert self._init_fingerprint, f'Trying to dump a GitHubDataset which is not properly initialized'
+        if chunks == -1:
+            chunks = list(range(len(self._chunk_map)))
+        if type(chunks) is int:
+            chunks = [chunks]
+        if file.suffix == '.json':
+            self.dump_fingerprint(file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}')))
+            for chunk in chunks:
+                chunk_file = file.with_name(file.name.replace(file.suffix, f'-{chunk}{file.suffix}'))
+                with open(chunk_file ,'w') as f:
+                    json_data_object = {
+                        'data': [
+                            {
+                                k: v for k, v in asdict(self[name]).items() if k[0] != '_'
+                            } for name in self._chunk_map[chunk]
+                        ],
+                        '_init_fingerprint': self._init_fingerprint
+                    }
+                    json.dump(json_data_object, f)
+        magi_dataclasses_logger.info(f'Dumped to {file}')
+     
+    def append(self, data: GitHubRepo) -> None:
+        '''
+        Append a new GitHubRepo object to self.data.
+        Arguments:
+            - data (GitHubRepo): GitHubRepo object to append.
+        Comments:
+            - For duplicates, this method try to overwrite the old value with the new one.
+        '''
+        assert type(data) is GitHubRepo
+        try:
+            self[data.name] = data
+        except:
+            self.data.append(data)
+            self.lang_stats[data.lang] += 1
+            self._append_rmap(data)
+
     @property   
     def statistics(self) -> pd.DataFrame:
         '''
@@ -655,13 +761,44 @@ class GitHubDataset(object):
         )
         data_df.index.name = 'Statistics'
         return data_df
-                
-if __name__ == '__main__':
-    # gd = GitHubDataset()
-    # gd.init_repos(fully_initialize=True, checkpoint_path='ghv9.json')
+
+def entry():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lang', type=str, default='Python')
+    parser.add_argument('--file', type=str, default='gh_data.json')
+    parser.add_argument('--max_repo_per_lang', type=int, default=50000)
+    parser.add_argument('--min_star_per_repo', type=int, default=500)
+    parser.add_argument('--iter_chunk_size', type=int, default=1000)
+    parser.add_argument('--gh_token', type=str, default=None)
+    parser.add_argument('--meta_only', type=bool, default=False)
+    parser.add_argument('--load_meta', type=str, default=None)
+    args = parser.parse_args()
+    
     github_dataset = GitHubDataset(
-        empty = False,
-        file_path = './ghv9-3.json',
-        load_nlp = True,
-        load_graph = True
+        empty = True,
+        gh_token = args.gh_token
     )
+
+    github_dataset.MAX_REPO_PER_LANG = args.max_repo_per_lang
+    github_dataset.MIN_STAR_PER_REPO = args.min_star_per_repo
+    github_dataset.ITER_CHUNK_SIZE = args.iter_chunk_size
+    github_dataset.LANG_LIST = [args.lang]
+    
+    if args.load_meta is not None:
+        github_dataset.load_fingerprint(args.load_meta)
+    else:
+        github_dataset.init_repos(fully_initialize=False)
+        if args.meta_only:
+            github_dataset.dump_fingerprint(f'{args.file}')
+            return
+
+    for chunk in range(github_dataset._chunk_num):
+        try:
+            github_dataset.update_repos(chunks=chunk)
+            github_dataset.dump(args.file, chunks=chunk)
+        except Exception as e:
+            with open('err.log', 'w+') as f:
+                f.write(f'chunk={chunk}, err: {e}\n')
+  
+if __name__ == '__main__':
+    entry()

@@ -5,6 +5,7 @@ beautifulsoup4
 deep_translator
 hn
 langdetect
+lxml
 Markdown
 networkx
 PyGithub
