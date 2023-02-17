@@ -18,7 +18,7 @@ URL = 'https://github.com/Enoch2090/magi_dataset'
 EMAIL = 'ycgu2090@gmail.com'
 AUTHOR = 'Enoch2090'
 REQUIRES_PYTHON = '>=3.7.0'
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 
 REQUIRED = [
     'numpy>=1.15.4',
