@@ -39,27 +39,41 @@ DEFAULT_FILES = {
     'patterns': os.path.join(os.path.dirname(__file__), 'data', 'patterns.txt'),
 }
 
-def download_file(link: str, local_file_name: str) -> None:
+def download_file(
+    link: str, 
+    local_file_name: str, 
+    verbose: bool = False, 
+    extra: str = ''
+) -> None:
     '''
     Arguments:
         - link (str): http link of file to download
         - local_file_name (str): local file name
+        - verbose (bool): whether to show tqdm bar
+        - extra (str): extra string displayed on tqdm bar
     '''
     r = requests.get(link, stream=True)
     file_size = int(r.headers.get('content-length'))
     with open(local_file_name, "wb") as f:
-        with tqdm(
-            total = file_size / 1024 / 1024,
-            desc = f'Downloading {local_file_name}',
-            unit = 'MB',
-            bar_format = '{desc}: {percentage:.2f}%|{bar}| {n:.2f}MB/{total:.2f}MB [{elapsed}<{remaining}]'
-        ) as _tqdm:
-            chunk_n = 0
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-                chunk_n += 1
-                _tqdm.update(1 / 1024)
+        if verbose:
+            with tqdm(
+                total = file_size / 1024 / 1024,
+                desc = f'Downloading {local_file_name}{extra}',
+                unit = 'MB',
+                dynamic_ncols = True,
+                bar_format = '{desc}: {percentage:.2f}%|{bar}| {n:.2f}MB/{total:.2f}MB [{elapsed}<{remaining}]'
+            ) as _tqdm:
+                chunk_n = 0
+                for chunk in r.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+                    chunk_n += 1
+                    _tqdm.update(0.999 / 1024)
+            return
+        for chunk in r.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+
 
 class IdleHandler:
     '''
@@ -128,8 +142,11 @@ class GitHubRepo:
         pattern = re.compile(r'(https?://)?github.com/(?!{})([^/^\(^\)^\s^<^>^#^\[^\]]*/[^/^\(^\)^\s^<^>^#^\[^\]]*)'.format(self.name))
         return list(set([x[-1] for x in pattern.findall(self.readme)] + [x[-1] for x in pattern.findall(self.hn_comments)]))
     
+    def __hash__(self) -> int:
+        return (self.name + self.gh_updated_time).__hash__()
+    
     @staticmethod
-    def _fields(self, preserved = False) -> set:
+    def _fields(preserved = False) -> set:
         if preserved:
             return set(
                 [x.name for x in fields(GitHubRepo)]
@@ -137,9 +154,6 @@ class GitHubRepo:
         return set(
             [x.name for x in fields(GitHubRepo) if x.name[0] != '_']
         )
-    
-    def __hash__(self) -> int:
-        return (self.name + self.gh_updated_time).__hash__()
     
 class GitHubDataset(object):
     MAX_REPO_PER_LANG = 100_000
@@ -161,7 +175,7 @@ class GitHubDataset(object):
         Arguments:
             - empty (bool): Whether to init the data. If true, the returned GitHubDataset object will be empty. GitHubDataset.init_repos() or GitHubDataset.load() can be called later to initialize the data.
             - lang_list (List[str]): Coding languages included in this GitHubDataset object. Default to ['Python', 'C++', 'JavaScript', 'Rust', 'Go'].
-            - file_path (str): If provided and empty=False, will try to load the file at given location. Can be one of str to online source, str to local file, or PathLike objects.
+            - file_path (str): If provided and empty=False, will try to load the file at given location. Can be one of str to online source, str to local file, or PathLike objects. Can also be one of the keys in https://huggingface.co/datasets/Enoch2090/github_semantic_search/blob/main/list.json, in this case will download the corresponding files.
             - patterns (Union[List[Union[str, re.Pattern]], str]): Either a str to a file containing regex patterns, or a list of patterns. If str, it must be a text file, with each line a new regex pattern. 
                 Example line: ^[\S]*[Mm]achine[-_]*[Ll]earning[\S]*$
             If list, must be either a list of str patterns, or a list of compiled regex object generated with re.compile().
@@ -186,45 +200,55 @@ class GitHubDataset(object):
         if empty:
             return
         
-        if file_path is None:
-            # fallback to check online versions of data
-            with tempfile.TemporaryDirectory() as tmpdirname:
+        if type(file_path) is str and (not Path(file_path).exists()):
+            # non-local source
+            try:
+                Path('./magi_downloads').mkdir()
+            except FileExistsError:
+                pass
+            if (not file_path.startswith('http')):
+                # default source
+                # fallback to check online versions of data
                 local_source_list = os.path.join(
-                    tmpdirname,
+                    './magi_downloads',
                     SOURCE_LIST_LINK.split('/')[-1]
                 )
                 download_file(
                     link = SOURCE_LIST_LINK,
                     local_file_name = local_source_list
                 )
+                
                 with open(local_source_list, 'r') as f:
                     source_list = json.load(f)
-                local_file_name = os.path.join(
-                    tmpdirname,
-                    source_list['latest_stable'].split('/')[-1]
+                
+                for index, file in enumerate(source_list[file_path]):
+                    local_file_name = os.path.join(
+                        './magi_downloads',
+                        file.split('/')[-1]
+                    )
+                    download_file(
+                        link = file,
+                        local_file_name = local_file_name,
+                        verbose = True,
+                        extra = f'{index + 1:2d}/{len(source_list[file_path])}'
+                    )
+                magi_dataclasses_logger.info(
+                    f"Default source files {file_path} downloaded to {Path('./magi_downloads').resolve().__str__()}"
                 )
-                if not os.path.exists(local_file_name):
-                    download_file(
-                        link = source_list['latest_stable'],
-                        local_file_name = local_file_name
-                    )
-                self.load(local_file_name)
-        else:    
-            if type(file_path) is str and file_path.startswith('http'):
-                # online source
-                with tempfile.TemporaryDirectory() as tmpdirname:
-                    local_file_name = os.path.join(tmpdirname, 'gh_corpus_tmp.json')
-                    download_file(
-                        link = file_path,
-                        local_file_name = local_file_name
-                    )
-                    magi_dataclasses_logger.info(
-                        f'Online source file {file_path} downloaded to {local_file_name}'
-                    )
-                    self.load(local_file_name)
+                local_file_name = local_file_name.split('-')[0] + '.json'
             else:
-                # local source
-                self.load(file_path)
+                local_file_name = os.path.join('./magi_downloads', 'gh_corpus_tmp.json')
+                download_file(
+                    link = file_path,
+                    local_file_name = local_file_name
+                )
+                magi_dataclasses_logger.info(
+                    f'Online source file {file_path} downloaded to {local_file_name}'
+                )
+            self.load(local_file_name)
+        else:    
+            # local source
+            self.load(file_path)
         
     def __getitem__(self, idx):
         assert type(idx) is int or type(idx) is str, 'Index must be either int index or repository name str index.'
@@ -550,7 +574,7 @@ class GitHubDataset(object):
             while True:
                 try:
                     self[repo_name] = self._update_repo(self[repo_name])
-                    magi_dataclasses_logger.info(f'Repo {repo_name} info updated')
+                    magi_dataclasses_logger.info(f'Repo {repo_name} info updated (stars={self[repo_name].stars})')
                     self._idle_handler_artifact.github_rate_limit_control_idle(0.05)
                 except RateLimitExceededException as e:
                     self._idle_handler_artifact.github_rate_limit_exceed_idle()
@@ -628,18 +652,21 @@ class GitHubDataset(object):
         '''
         if type(file) is str:
             file = Path(file)
+        meta_file = file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}'))
         file = file.resolve()
-        assert file.exists(), f'{file} does not exist'
+        meta_file = meta_file.resolve()
+        assert meta_file.exists(), f'{meta_file} does not exist'
         assert file.suffix in ['.json'], f'Unsupported load type {file.suffix}'
+        self.load_fingerprint(meta_file)
+        
         if chunks == -1:
             chunks = list(range(len(self._chunk_map)))
         if type(chunks) is int:
             chunks = [chunks]
         if file.suffix == '.json':
-            self.load_fingerprint(file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}')))
             for chunk in chunks:
                 chunk_file = file.with_name(file.name.replace(file.suffix, f'-{chunk}{file.suffix}'))
-                with open(chunk_file ,'w') as f:
+                with open(chunk_file ,'r') as f:
                     json_data_object = json.load(f)
                 assert json_data_object['_init_fingerprint'] == self._init_fingerprint, f'File {chunk_file} has mismatched fingerprint with metadata.'
                 for d in json_data_object['data']:
@@ -668,7 +695,9 @@ class GitHubDataset(object):
         '''
         if type(file) is str:
             file = Path(file)
+        meta_file = file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}'))
         file = file.resolve()
+        meta_file = meta_file.resolve()
         assert file.suffix in ['.json'], f'Unsupported dump type {file.suffix}'
         assert self._init_fingerprint, f'Trying to dump a GitHubDataset which is not properly initialized'
         if chunks == -1:
@@ -676,7 +705,7 @@ class GitHubDataset(object):
         if type(chunks) is int:
             chunks = [chunks]
         if file.suffix == '.json':
-            self.dump_fingerprint(file.with_name(file.name.replace(file.suffix, f'-metadata{file.suffix}')))
+            self.dump_fingerprint(meta_file)
             for chunk in chunks:
                 chunk_file = file.with_name(file.name.replace(file.suffix, f'-{chunk}{file.suffix}'))
                 with open(chunk_file ,'w') as f:
@@ -690,6 +719,26 @@ class GitHubDataset(object):
                     }
                     json.dump(json_data_object, f)
         magi_dataclasses_logger.info(f'Dumped to {file}')
+        
+    def upload_to_es(
+        self, 
+        es_server: str = 'http://localhost:9200'
+    ) -> None:
+        '''
+        Upload contents of data to a Elasticsearch server.
+        Arguments:
+            - es_server (str): ES cluster API address.
+        '''
+        try:
+            from elasticsearch import Elasticsearch
+        except ImportError:
+            magi_dataclasses_logger.error(f'Package elasticsearch not installed. Please use pip install magi_dataclass[elasticsearch] to ensure dependency.')
+            return
+        
+        # TODO: 1.0.5 is a temporary fix for downloading default chunked files.
+        # upload to ES feature is therefore still under development.
+        raise NotImplemented
+        
      
     def append(self, data: GitHubRepo) -> None:
         '''
