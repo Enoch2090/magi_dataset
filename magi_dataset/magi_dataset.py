@@ -43,7 +43,8 @@ def download_file(
     link: str, 
     local_file_name: str, 
     verbose: bool = False, 
-    extra: str = ''
+    extra: str = '',
+    redownload: bool = False
 ) -> None:
     '''
     Arguments:
@@ -51,9 +52,13 @@ def download_file(
         - local_file_name (str): local file name
         - verbose (bool): whether to show tqdm bar
         - extra (str): extra string displayed on tqdm bar
+        - redownload (bool): If same file is found locally, whether to redownload.
     '''
+    if not redownload and Path(local_file_name).exists():
+        return
     r = requests.get(link, stream=True)
     file_size = int(r.headers.get('content-length'))
+    
     with open(local_file_name, "wb") as f:
         if verbose:
             with tqdm(
@@ -169,7 +174,8 @@ class GitHubDataset(object):
         lang_list: List[str] = None, 
         file_path: Union[str, os.PathLike, Path] = None, 
         patterns: Union[str, os.PathLike, Path] = None, 
-        gh_token: str = None
+        gh_token: str = None,
+        redownload: bool = False
     ):
         '''
         Arguments:
@@ -180,6 +186,8 @@ class GitHubDataset(object):
                 Example line: ^[\S]*[Mm]achine[-_]*[Ll]earning[\S]*$
             If list, must be either a list of str patterns, or a list of compiled regex object generated with re.compile().
             If left blank, the default list will be used.
+            - gh_token (str): Token for initializing GitHub API. If not provided, will look for $GH_TOKEN environment variable. If neither provided, will initialize with no token, causing the rate limit extremely low.
+            - redownload (bool): If the provided file_path argument is an online file, this argument decides whether to redownload, if files of same name is found under './magi_downloads'.
         '''
         self.data = []
         self._translate_err_counter = 0
@@ -230,17 +238,19 @@ class GitHubDataset(object):
                         link = file,
                         local_file_name = local_file_name,
                         verbose = True,
-                        extra = f'{index + 1:2d}/{len(source_list[file_path])}'
+                        extra = f'{index + 1:2d}/{len(source_list[file_path])}',
+                        redownload = redownload
                     )
                 magi_dataclasses_logger.info(
                     f"Default source files {file_path} downloaded to {Path('./magi_downloads').resolve().__str__()}"
                 )
                 local_file_name = local_file_name.split('-')[0] + '.json'
             else:
-                local_file_name = os.path.join('./magi_downloads', 'gh_corpus_tmp.json')
+                local_file_name = os.path.join('./magi_downloads', file_path.split('/')[-1])
                 download_file(
                     link = file_path,
-                    local_file_name = local_file_name
+                    local_file_name = local_file_name,
+                    redownload = redownload
                 )
                 magi_dataclasses_logger.info(
                     f'Online source file {file_path} downloaded to {local_file_name}'

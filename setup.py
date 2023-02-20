@@ -18,7 +18,7 @@ URL = 'https://github.com/Enoch2090/magi_dataset'
 EMAIL = 'ycgu2090@gmail.com'
 AUTHOR = 'Enoch2090'
 REQUIRES_PYTHON = '>=3.7.0'
-VERSION = '1.0.3'
+VERSION = '1.0.6'
 
 REQUIRED = [
     'numpy>=1.15.4',
@@ -38,6 +38,12 @@ REQUIRED = [
     'setuptools',
     'tqdm'
 ]
+
+EXTRA_REQUIRE = {
+    'elasticsearch': [
+        'elasticsearch'
+    ]
+}
 
 # The rest you shouldn't have to touch too much :)
 # ------------------------------------------------
@@ -106,13 +112,14 @@ setup(
     author=AUTHOR,
     author_email=EMAIL,
     python_requires=REQUIRES_PYTHON,
+    extras_require=EXTRA_REQUIRE,
     url=URL,
     packages=find_packages(exclude=('tests',)),
     install_requires=REQUIRED,
     package_dir={'': './'},
     include_package_data=True,
     package_data={
-            'data':['data/patterns.txt'],
+            'magi_dataset.data':['patterns.txt'],
             '': ['./requirements.txt']
     },
     license='GPLv3',

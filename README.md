@@ -140,6 +140,9 @@
 
   ## Changelogs
 
+  ### v1.0.6
+  Temporary fix. Added `redownload` parameter to `GitHubDataset` to avoid redownload of the same file in multiple local runs.
+
   ### v1.0.5 
 
   Updated default list of files to ghv10. Users may also retrieve default files with keyname in the latest list. For example if the list states
