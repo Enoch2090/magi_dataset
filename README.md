@@ -140,8 +140,8 @@
 
   ## Changelogs
 
-  ### v1.0.6
-  Temporary fix. Added `redownload` parameter to `GitHubDataset` to avoid redownload of the same file in multiple local runs.
+  ### v1.0.7
+  Temporary fix. Added `redownload` parameter to `GitHubDataset` to avoid redownload of the same file in multiple local runs. Fixed a bug where local files can not be load.
 
   ### v1.0.5 
 

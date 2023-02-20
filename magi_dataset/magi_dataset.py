@@ -207,8 +207,8 @@ class GitHubDataset(object):
         self._load_patterns(patterns)
         if empty:
             return
-        
-        if type(file_path) is str and (not Path(file_path).exists()):
+
+        if type(file_path) is str and (not Path(file_path.replace('.json', '-metadata.json')).exists()):
             # non-local source
             try:
                 Path('./magi_downloads').mkdir()
