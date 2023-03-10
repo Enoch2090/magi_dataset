@@ -13,7 +13,7 @@ import tempfile
 
 
 from bs4 import BeautifulSoup
-from typing import List, Tuple, Union, Dict, Callable, final
+from typing import List, Tuple, Union, Dict, Callable
 from tqdm import tqdm, trange
 from datetime import datetime
 from pathlib import Path
@@ -175,7 +175,8 @@ class GitHubDataset(object):
         file_path: Union[str, os.PathLike, Path] = None, 
         patterns: Union[str, os.PathLike, Path] = None, 
         gh_token: str = None,
-        redownload: bool = False
+        redownload: bool = False,
+        run_filter: bool = True
     ):
         '''
         Arguments:
@@ -188,6 +189,7 @@ class GitHubDataset(object):
             If left blank, the default list will be used.
             - gh_token (str): Token for initializing GitHub API. If not provided, will look for $GH_TOKEN environment variable. If neither provided, will initialize with no token, causing the rate limit extremely low.
             - redownload (bool): If the provided file_path argument is an online file, this argument decides whether to redownload, if files of same name is found under './magi_downloads'.
+            - run_filter (bool): Run the filters in patterns argument again to remove repos.
         '''
         self.data = []
         self._translate_err_counter = 0
@@ -260,6 +262,17 @@ class GitHubDataset(object):
             # local source
             self.load(file_path)
         
+        if run_filter:
+            old_len = len(self.data)
+            self.data = [
+                repo for repo in self.data if not self._matches_pattern(repo.name)
+            ]
+            magi_dataclasses_logger.info(f'run_filter = True, {old_len - len(self.data)} repos filtered.')
+            self._rebuild_rmap()
+            self._rebuild_chunk_map()
+        else:
+            magi_dataclasses_logger.info(f'run_filter = False, skip post-filtering.')
+            
     def __getitem__(self, idx):
         assert type(idx) is int or type(idx) is str, 'Index must be either int index or repository name str index.'
         if type(idx) is int:
@@ -394,13 +407,39 @@ class GitHubDataset(object):
     def _rebuild_rmap(self):
         for index, repo in enumerate(self.data):
             self.reverse_map[repo.name] = index
+    
+    def _rebuild_chunk_map(self):
+        self._chunk_map = [[]]
+        self._chunk_lang_map = [[]]
+        self._chunk_sizes = [0]
+        for index, repo in enumerate(self.data):
+            if (index + 1) % self.ITER_CHUNK_SIZE == 0:
+                self._chunk_sizes.append(0)
+                self._chunk_map.append([])
+                self._chunk_lang_map.append([])
+            self._chunk_sizes[-1] += 1
+            self._chunk_map[-1].append(repo.name)
+            self._chunk_lang_map[-1].append(repo.lang)
             
     def _append_rmap(
         self, 
         data: GitHubRepo
     ):
+        self.lang_stats[data.lang] += 1
         self.reverse_map[data.name] = len(self.reverse_map)
     
+    def _append_chunk_map(
+        self,
+        data: GitHubRepo
+    ):
+        if (len(self.data) + 1) % self.ITER_CHUNK_SIZE == 0:
+            self._chunk_sizes.append(0)
+            self._chunk_map.append([])
+            self._chunk_lang_map.append([])
+        self._chunk_sizes[-1] += 1
+        self._chunk_map[-1].append(data.name)
+        self._chunk_lang_map[-1].append(data.lang)
+        
     def _translate_wrapper(
         self, 
         x: Union[str, list]
@@ -492,7 +531,7 @@ class GitHubDataset(object):
         if type(patterns[0]) is str:
             self.patterns = [re.compile(r'{}'.format(p)) for p in self.patterns]
 
-    def _matches_pattern(self, name:str):
+    def _matches_pattern(self, name: str):
         '''
         Check whether the given name matches any of the pattern loaded by GitHubDataset._load_patterns()
         '''
@@ -763,8 +802,8 @@ class GitHubDataset(object):
             self[data.name] = data
         except:
             self.data.append(data)
-            self.lang_stats[data.lang] += 1
             self._append_rmap(data)
+            self._append_chunk_map(data)
 
     @property   
     def statistics(self) -> pd.DataFrame:
