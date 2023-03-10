@@ -650,7 +650,7 @@ class GitHubDataset(object):
             - file(Union[str, Path]): .json file containing the fingerprint.
         '''
         with open(file, 'r') as f:
-                metadata = json.load(f)
+            metadata = json.load(f)
         self._init_fingerprint = metadata['_init_fingerprint']
         self._chunk_map = metadata['_chunk_map']
         self._chunk_lang_map = metadata['_chunk_lang_map']
@@ -664,7 +664,8 @@ class GitHubDataset(object):
                     GitHubRepo(
                         name = self._chunk_map[chunk_id][repo_id],
                         lang = self._chunk_lang_map[chunk_id][repo_id]
-                    )
+                    ),
+                    _chunk_map_integrate = True
                 )
         self._rebuild_rmap()
 
@@ -789,7 +790,7 @@ class GitHubDataset(object):
         raise NotImplemented
         
      
-    def append(self, data: GitHubRepo) -> None:
+    def append(self, data: GitHubRepo, _chunk_map_integrate: bool = False) -> None:
         '''
         Append a new GitHubRepo object to self.data.
         Arguments:
@@ -803,7 +804,8 @@ class GitHubDataset(object):
         except:
             self.data.append(data)
             self._append_rmap(data)
-            self._append_chunk_map(data)
+            if not _chunk_map_integrate:
+                self._append_chunk_map(data)
 
     @property   
     def statistics(self) -> pd.DataFrame:
